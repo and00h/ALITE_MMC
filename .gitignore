@@ -1,0 +1,8 @@
+.settings/
+Debug/
+MMC_old/
+Release_A/
+Release_B/
+.osx.project
+.DS_Store
+
