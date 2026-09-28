@@ -161,13 +161,13 @@ typedef enum {
  * argomenti a partire da COM_CTRL_PAYLOAD_ARGS (byte 1..32), con layout
  * specifico per comando (COM_CTRL_*_THR_* sotto, offset relativi a ARGS). */
 #define COM_CTRL_PAYLOAD_OPCODE                 0U
-#define COM_CTRL_PAYLOAD_FSM                    1U
-#define COM_CTRL_PAYLOAD_SW_POWER_SETPOINT      2U
-#define COM_CTRL_PAYLOAD_QCW_ERR                3U
-#define COM_CTRL_PAYLOAD_QCW_FREQ_HZ            4U   /* uint32 LE, byte 4..7 */
-#define COM_CTRL_PAYLOAD_QCW_DC                 8U
-#define COM_CTRL_PAYLOAD_MODE                   9U
-#define COM_CTRL_PAYLOAD_GATE_HW_SETPOINT_HW    10U
+#define COM_CTRL_PAYLOAD_FSM                    0U
+#define COM_CTRL_PAYLOAD_SW_POWER_SETPOINT      0U
+#define COM_CTRL_PAYLOAD_QCW_ERR                0U
+#define COM_CTRL_PAYLOAD_QCW_FREQ_HZ            0U   /* uint32 LE, byte 4..7 */
+#define COM_CTRL_PAYLOAD_QCW_DC                 0U
+#define COM_CTRL_PAYLOAD_MODE                   0U
+#define COM_CTRL_PAYLOAD_GATE_HW_SETPOINT_HW    0U
 
 #define COM_CTRL_PAYLOAD_ARGS                   1U
 #define COM_CTRL_PAYLOAD_ARGS_SIZE              32U
@@ -192,6 +192,55 @@ typedef enum {
 /* SET_DEW_THR (67): livello, margine [°C] */
 #define COM_CTRL_DEW_THR_LEVEL                  0U
 #define COM_CTRL_DEW_THR_VALUE_C                1U
+
+/* SET_DELAY (68): target (COM_CTRL_DELAY_TGT_*), valore [ms] uint16 LE */
+#define COM_CTRL_DELAY_TARGET                   0U
+#define COM_CTRL_DELAY_VALUE_MS                 1U
+#define COM_CTRL_DELAY_TGT_PSU                  0U
+#define COM_CTRL_DELAY_TGT_SAB                  1U
+#define COM_CTRL_DELAY_TGT_CONTACTOR            2U
+
+/* SETERRMASK..SET_PD_MASK (48..57): la maschera viaggia SEMPRE come uint32
+ * LE, qualunque sia la sua larghezza reale — il range si verifica per opcode. */
+#define COM_CTRL_MASK_VALUE                     0U
+
+/* SET_NTC_MAP (70): serigrafia (1-16), NTC_SensorId_t o COM_CTRL_NTC_MAP_OFF */
+#define COM_CTRL_NTC_MAP_SERIGRAPHY             0U
+#define COM_CTRL_NTC_MAP_SENSOR                 1U
+#define COM_CTRL_NTC_MAP_OFF                    0xFFU
+
+/* LOGIN (14) / SET_PASS (96): password in campi fissi da COM_CTRL_PASS_SIZE
+ * byte, completati con NUL (quindi al massimo COM_CTRL_PASS_SIZE - 1
+ * caratteri). LOGIN risponde COM_RESP_AUTH a password errata; SET_PASS
+ * risponde COM_RESP_AUTH se la vecchia e' errata, COM_RESP_ERR se la nuova non
+ * e' lunga 4-15 caratteri. */
+#define COM_CTRL_PASS_SIZE                      16U
+#define COM_CTRL_LOGIN_PASS                     0U
+#define COM_CTRL_SET_PASS_OLD                   0U
+#define COM_CTRL_SET_PASS_NEW                   COM_CTRL_PASS_SIZE
+
+/* SETLUTGAIN (32): modo (0=SW, 1=HW), 4 soglie uint16 LE */
+#define COM_CTRL_LUT_GAIN_MODE                  0U
+#define COM_CTRL_LUT_GAIN_T0                    1U
+
+/* SETLUTVALID (33): pd, modo, entry, setpoint/min/max uint16 LE */
+#define COM_CTRL_LUT_VALID_PD                   0U
+#define COM_CTRL_LUT_VALID_MODE                 1U
+#define COM_CTRL_LUT_VALID_ENTRY                2U
+#define COM_CTRL_LUT_VALID_SP                   3U
+#define COM_CTRL_LUT_VALID_MIN                  5U
+#define COM_CTRL_LUT_VALID_MAX                  7U
+
+/* SETLUTPOWER (34): pd, finestra, entry, adc/watt uint16 LE */
+#define COM_CTRL_LUT_POWER_PD                   0U
+#define COM_CTRL_LUT_POWER_WIN                  1U
+#define COM_CTRL_LUT_POWER_ENTRY                2U
+#define COM_CTRL_LUT_POWER_ADC                  3U
+#define COM_CTRL_LUT_POWER_WATT                 5U
+
+/* SETLUTSETPOINT (35): indice (0-20, passi del 5%), corrente [mA] uint16 LE */
+#define COM_CTRL_LUT_SETPOINT_IDX               0U
+#define COM_CTRL_LUT_SETPOINT_CURRENT_MA        1U
 
 /* Codifiche degli argomenti soglia (ALITE_COM alite_system.h,
  * ALITE_threshold_level_e/_limit_e/_hum_target_e/_sensor_e). */

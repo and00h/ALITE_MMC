@@ -113,4 +113,34 @@ const char *Rs485Cmd_StateStr(SysState_t st);
  */
 void Rs485Cmd_NotifyFault(SysEvent_t ev, bool is_alarm);
 
+/* ============================================================================
+ * PASSWORD E MAPPA NTC CONDIVISE CON LA COM INTERFACE
+ * ============================================================================
+ * La COM interface (COM_interface_app.c, opcode LOGIN/SET_PASS/SET_NTC_MAP)
+ * usa la stessa password e la stessa corrispondenza serigrafia -> canale dei
+ * comandi RS485 "LOGIN"/"SET PASSWORD"/"SET NTC MAP", invece di averne di
+ * proprie. Nessuna sessione qui: la COM interface tiene la propria.
+ */
+
+typedef enum {
+    RS485_PW_OK = 0,
+    RS485_PW_WRONG_OLD,      /* vecchia password errata */
+    RS485_PW_INVALID_NEW,    /* nuova password fuori dai 4-15 caratteri */
+} Rs485PwStatus_t;
+
+/**
+ * @brief  true se pw e' la password corrente. Case-insensitive, come "LOGIN".
+ */
+bool Rs485Cmd_CheckPassword(const char *pw);
+
+/**
+ * @brief  Cambia la password, come "SET PASSWORD <old> <new>". Resta in RAM.
+ */
+Rs485PwStatus_t Rs485Cmd_ChangePassword(const char *old_pw, const char *new_pw);
+
+/**
+ * @brief  Canale AD7490 (0-15) della serigrafia PCB 1-16, 0xFF se fuori range.
+ */
+uint8_t Rs485Cmd_NtcSerigrafiaToCh(uint8_t serigrafia);
+
 #endif /* APP_RS485_RS485_CMD_H_ */

@@ -32,6 +32,7 @@
 #include "SAB.h"                 /* SAB_GetState() */
 #include "EXT_interface.h"       /* EXT_GetPowerSetpointRaw(): setpoint HW (PC5) */
 #include "lut_manager.h"         /* LUT_ConvertHwPowerToPct(): NUOVO 2026-08-01 */
+#include "rs485_cmd.h"           /* Rs485Cmd_CheckPassword()/ChangePassword()/NtcSerigrafiaToCh() */
 
 /* ========================================================================== */
 /* --- HELPER --- */
@@ -322,10 +323,12 @@ void COM_App_HandleStatus(const uint8_t *req_payload, uint8_t *resp_payload)
     tbl.flow1_lpm_x10 = (int16_t)(FlowMeter_GetFlowRate(FLOW_METER_1) * 10.0f);
     tbl.flow2_lpm_x10 = (int16_t)(FlowMeter_GetFlowRate(FLOW_METER_2) * 10.0f);
 
-    /* ntc_map_serigrafia[16]: TODO, la traduzione serigrafia -> canale AD7490
-     * (s_ntc_serigrafia_to_ch[]) e' privata di rs485_cmd.c, non ancora
-     * esposta come API pubblica (g_config.ntc_ch_map e' indicizzato per
-     * CANALE, non serigrafia) — resta a 0 (memset sopra). */
+    /* ntc_map_serigrafia[16]: sensore (NTC_SensorId_t, 0xFF = OFF) di ogni
+     * serigrafia 1-16 — g_config.ntc_ch_map e' indicizzato per CANALE AD7490,
+     * da cui la traduzione (stessa di "GET NTC MAP"). */
+    for (uint8_t s = 1U; s <= 16U; s++) {
+        tbl.ntc_map_serigrafia[s - 1U] = g_config.ntc_ch_map[Rs485Cmd_NtcSerigrafiaToCh(s)];
+    }
 
     tbl.ntc_active_mask = TaskMonitor_GetNTCActiveMask();
 
@@ -506,6 +509,182 @@ static COM_RespStatus_t set_dew_thr(const uint8_t *args)
 }
 
 /* ========================================================================== */
+/* --- LUT, MASCHERE, RITARDI, MAPPA NTC, PASSWORD --- */
+/* ========================================================================== */
+
+/*
+ * Stessi range e stesse guardie di stato dei comandi RS485 equivalenti
+ * ("SET LUT ...", "SET ... MASK", "SET DELAY", "SET NTC MAP", "LOGIN",
+ * "SET PASSWORD" in rs485_cmd.c). Come per le soglie, il login RS485 non si
+ * applica al canale COM: e' la COM interface a chiedere il login (LOGIN qui
+ * sotto) e a tenere la sessione dei propri client prima di inoltrare questi
+ * comandi. LUT gain/valid/power restano in RAM fino a SAVE_LUT, maschere/
+ * ritardi/mappa NTC fino a SAVE_CONF; la LUT setpoint la persiste subito
+ * Config_SetLUTEntry(), come "SET LUT SETPOINT".
+ */
+#define COM_LUT_GAIN_THRESHOLDS   4U      /* t0..t3, come "SET LUT GAIN" */
+#define COM_DELAY_MAX_MS          10000U  /* come "SET DELAY" */
+
+static uint16_t get_u16(const uint8_t *p)
+{
+    uint16_t v;
+    memcpy(&v, p, sizeof v);
+    return v;
+}
+
+static uint32_t get_u32(const uint8_t *p)
+{
+    uint32_t v;
+    memcpy(&v, p, sizeof v);
+    return v;
+}
+
+static bool lut_mode_valid(uint8_t mode)
+{
+    return (mode == LUT_MODE_SW) || (mode == LUT_MODE_HW);
+}
+
+static COM_RespStatus_t set_lut_gain(const uint8_t *args)
+{
+    uint8_t mode = args[COM_CTRL_LUT_GAIN_MODE];
+    if (!lut_mode_valid(mode)) { return COM_RESP_ERR; }
+
+    for (uint8_t i = 0U; i < COM_LUT_GAIN_THRESHOLDS; i++) {
+        LUT_SetGainThreshold(mode, i, get_u16(&args[COM_CTRL_LUT_GAIN_T0 + (2U * i)]));
+    }
+    return COM_RESP_OK;
+}
+
+static COM_RespStatus_t set_lut_valid(const uint8_t *args)
+{
+    uint8_t pd    = args[COM_CTRL_LUT_VALID_PD];
+    uint8_t mode  = args[COM_CTRL_LUT_VALID_MODE];
+    uint8_t entry = args[COM_CTRL_LUT_VALID_ENTRY];
+    if (pd >= LUT_PD_MAX || !lut_mode_valid(mode) || entry >= LUT_PD_VALID_SIZE) { return COM_RESP_ERR; }
+
+    LUT_SetPDValidEntry(mode, pd, entry, get_u16(&args[COM_CTRL_LUT_VALID_SP]),
+                        get_u16(&args[COM_CTRL_LUT_VALID_MIN]), get_u16(&args[COM_CTRL_LUT_VALID_MAX]));
+    return COM_RESP_OK;
+}
+
+static COM_RespStatus_t set_lut_power(const uint8_t *args)
+{
+    uint8_t pd    = args[COM_CTRL_LUT_POWER_PD];
+    uint8_t win   = args[COM_CTRL_LUT_POWER_WIN];
+    uint8_t entry = args[COM_CTRL_LUT_POWER_ENTRY];
+    if (pd >= LUT_PD_MAX || win >= LUT_GAIN_WINDOWS || entry >= LUT_PD_POWER_SIZE) { return COM_RESP_ERR; }
+
+    LUT_SetPDPowerEntry(pd, win, entry, get_u16(&args[COM_CTRL_LUT_POWER_ADC]),
+                        get_u16(&args[COM_CTRL_LUT_POWER_WATT]));
+    return COM_RESP_OK;
+}
+
+static COM_RespStatus_t set_lut_setpoint(const uint8_t *args)
+{
+    uint8_t idx = args[COM_CTRL_LUT_SETPOINT_IDX];
+    if (idx >= SETPOINT_LUT_SIZE) { return COM_RESP_ERR; }
+
+    return (Config_SetLUTEntry(idx, get_u16(&args[COM_CTRL_LUT_SETPOINT_CURRENT_MA])) == CONFIG_OK)
+         ? COM_RESP_OK : COM_RESP_ERR;
+}
+
+static COM_RespStatus_t set_mask(COM_ControlOpcode_t opcode, const uint8_t *args)
+{
+    uint32_t v = get_u32(&args[COM_CTRL_MASK_VALUE]);
+    /* PSU, CONTACTOR e PD solo in IDLE, come su RS485. */
+    bool idle = (FSM_GetState() == SYS_IDLE);
+
+    switch (opcode) {
+    case COM_CTRL_OP_SETERRMASK:    g_config.error_mask       = v; break;
+    case COM_CTRL_OP_SETWARNMASK:   g_config.warning_mask     = v; break;
+    case COM_CTRL_OP_SETFAULTMASK:  g_config.fault_mask       = v; break;
+    case COM_CTRL_OP_SETFAULTLATCH: g_config.fault_latch_mask = v; break;
+    case COM_CTRL_OP_SET_TEMP_MASK:
+        if (v > 0x1FFU) { return COM_RESP_ERR; }
+        g_config.temp_sensor_enabled_mask = (uint16_t)v;
+        break;
+    case COM_CTRL_OP_SET_FLOW_MASK:
+        if (v > 0x03U) { return COM_RESP_ERR; }
+        g_config.flow_sensor_enabled_mask = (uint8_t)v;
+        break;
+    case COM_CTRL_OP_SET_PSU_MASK:
+        if (!idle || v > 0x03U) { return COM_RESP_ERR; }
+        g_config.psu_enabled_mask = (uint8_t)v;
+        break;
+    case COM_CTRL_OP_SET_CONTACTOR_MASK:
+        if (!idle || v > 0x03U) { return COM_RESP_ERR; }
+        g_config.contactor_enabled_mask = (uint8_t)v;
+        break;
+    case COM_CTRL_OP_SET_EFUSE_MASK:
+        /* Applicata solo al prossimo boot (EFuse_Init()), come "SET EFUSE MASK". */
+        if (v > 0x0FU) { return COM_RESP_ERR; }
+        g_config.efuse_enabled_mask = v;
+        break;
+    case COM_CTRL_OP_SET_PD_MASK:
+        if (!idle || v > 0x0FU) { return COM_RESP_ERR; }
+        g_config.pd_mask = (uint8_t)v;
+        break;
+    default:
+        return COM_RESP_ERR;
+    }
+    return COM_RESP_OK;
+}
+
+static COM_RespStatus_t set_delay(const uint8_t *args)
+{
+    uint16_t v = get_u16(&args[COM_CTRL_DELAY_VALUE_MS]);
+    if (v > COM_DELAY_MAX_MS) { return COM_RESP_ERR; }
+
+    /* Stessa corrispondenza dei campi CFG_DLY_* della tabella di stato. */
+    switch (args[COM_CTRL_DELAY_TARGET]) {
+    case COM_CTRL_DELAY_TGT_PSU:       g_config.psu_dc_ok_delay_ms       = v; break;
+    case COM_CTRL_DELAY_TGT_SAB:       g_config.sab_interlock_timeout_ms = v; break;
+    case COM_CTRL_DELAY_TGT_CONTACTOR: g_config.contactor_psu_delay_ms   = v; break;
+    default: return COM_RESP_ERR;
+    }
+    return COM_RESP_OK;
+}
+
+static COM_RespStatus_t set_ntc_map(const uint8_t *args)
+{
+    uint8_t ch  = Rs485Cmd_NtcSerigrafiaToCh(args[COM_CTRL_NTC_MAP_SERIGRAPHY]);
+    uint8_t sid = args[COM_CTRL_NTC_MAP_SENSOR];
+    if (ch == 0xFFU || (sid >= NTC_NUM_SENSORS && sid != COM_CTRL_NTC_MAP_OFF)) { return COM_RESP_ERR; }
+
+    g_config.ntc_ch_map[ch] = sid;
+    return COM_RESP_OK;
+}
+
+/* Campo password (COM_CTRL_PASS_SIZE byte) -> stringa; false se il campo non
+ * contiene il terminatore. */
+static bool pass_from_field(const uint8_t *field, char out[COM_CTRL_PASS_SIZE])
+{
+    memcpy(out, field, COM_CTRL_PASS_SIZE);
+    return memchr(out, '\0', COM_CTRL_PASS_SIZE) != NULL;
+}
+
+static COM_RespStatus_t login(const uint8_t *args)
+{
+    char pw[COM_CTRL_PASS_SIZE];
+    if (!pass_from_field(&args[COM_CTRL_LOGIN_PASS], pw) || pw[0] == '\0') { return COM_RESP_ERR; }
+    return Rs485Cmd_CheckPassword(pw) ? COM_RESP_OK : COM_RESP_AUTH;
+}
+
+static COM_RespStatus_t set_pass(const uint8_t *args)
+{
+    char old_pw[COM_CTRL_PASS_SIZE];
+    char new_pw[COM_CTRL_PASS_SIZE];
+    if (!pass_from_field(&args[COM_CTRL_SET_PASS_OLD], old_pw)
+        || !pass_from_field(&args[COM_CTRL_SET_PASS_NEW], new_pw)) { return COM_RESP_ERR; }
+
+    switch (Rs485Cmd_ChangePassword(old_pw, new_pw)) {
+    case RS485_PW_OK:        return COM_RESP_OK;
+    case RS485_PW_WRONG_OLD: return COM_RESP_AUTH;
+    default:                 return COM_RESP_ERR;
+    }
+}
+
+/* ========================================================================== */
 /* --- CONTROL --- */
 /* ========================================================================== */
 
@@ -518,16 +697,16 @@ void COM_App_HandleControl(const uint8_t *req_payload, uint8_t *resp_payload)
                        * restano guidate dall'opcode sotto, non da fsm_flags
                        * direttamente (stesso principio di rs485_cmd.c: un
                        * comando alla volta, non uno snapshot di stato). */
-    uint8_t  power_pct = req_payload[COM_CTRL_PAYLOAD_SW_POWER_SETPOINT];
-    uint8_t  qcw_ctrl   = req_payload[COM_CTRL_PAYLOAD_QCW_ERR];
+    const uint8_t *args = &req_payload[COM_CTRL_PAYLOAD_ARGS];
+    uint8_t  power_pct = args[COM_CTRL_PAYLOAD_SW_POWER_SETPOINT];
+    uint8_t  qcw_ctrl   = args[COM_CTRL_PAYLOAD_QCW_ERR];
     uint32_t qcw_freq_hz;
-    memcpy(&qcw_freq_hz, &req_payload[COM_CTRL_PAYLOAD_QCW_FREQ_HZ], sizeof qcw_freq_hz);
-    uint8_t  qcw_duty = req_payload[COM_CTRL_PAYLOAD_QCW_DC];
-    uint8_t  mode     = req_payload[COM_CTRL_PAYLOAD_MODE];
-    uint8_t  hw_ctrl  = req_payload[COM_CTRL_PAYLOAD_GATE_HW_SETPOINT_HW];
+    memcpy(&qcw_freq_hz, &args[COM_CTRL_PAYLOAD_QCW_FREQ_HZ], sizeof qcw_freq_hz);
+    uint8_t  qcw_duty = args[COM_CTRL_PAYLOAD_QCW_DC];
+    uint8_t  mode     = args[COM_CTRL_PAYLOAD_MODE];
+    uint8_t  hw_ctrl  = args[COM_CTRL_PAYLOAD_GATE_HW_SETPOINT_HW];
     /* Stessi byte dei campi sopra, letti come argomenti dagli opcode che non
      * usano i campi fissi (vedi COM_CTRL_PAYLOAD_ARGS). */
-    const uint8_t *args = &req_payload[COM_CTRL_PAYLOAD_ARGS];
     COM_ControlOpcode_t opcode = (COM_ControlOpcode_t)req_payload[COM_CTRL_PAYLOAD_OPCODE];
 
     COM_RespStatus_t status = COM_RESP_OK;
@@ -639,19 +818,69 @@ void COM_App_HandleControl(const uint8_t *req_payload, uint8_t *resp_payload)
     }
 
     /*
-     * Comandi protetti da login su RS485 (REQUIRE_AUTH()) senza equivalente
-     * di sessione autenticata sul protocollo SPI COM attuale (nessun campo
-     * password/token nel payload CONTROL fisso) -> rifiutati esplicitamente
+     * Comandi protetti da login su RS485 (REQUIRE_AUTH()) che la COM
+     * interface non ha ancora motivo di inviare -> rifiutati esplicitamente
      * con AUTH invece di essere eseguiti senza controllo.
      */
     case COM_CTRL_OP_FRST:
     case COM_CTRL_OP_SETCURRENT:
-    case COM_CTRL_OP_SAVE_CONF:
-    case COM_CTRL_OP_SAVE_LUT:
-    case COM_CTRL_OP_RESET_LUT:
-    case COM_CTRL_OP_LOGIN:
-    case COM_CTRL_OP_LOGOUT:
         status = COM_RESP_AUTH;
+        break;
+
+    /* --- Login e persistenza (vedi il banner sopra set_lut_gain()) --------- */
+    case COM_CTRL_OP_LOGIN:
+        status = login(args);
+        break;
+    case COM_CTRL_OP_LOGOUT:
+        /* Nessuna sessione lato MMC per il canale COM: niente da chiudere. */
+        break;
+    case COM_CTRL_OP_SET_PASS:
+        status = set_pass(args);
+        break;
+    case COM_CTRL_OP_SAVE_CONF:
+        status = (Config_Save() == CONFIG_OK) ? COM_RESP_OK : COM_RESP_ERR;
+        break;
+    case COM_CTRL_OP_SAVE_LUT:
+        status = LUT_Save() ? COM_RESP_OK : COM_RESP_ERR;
+        break;
+    case COM_CTRL_OP_RESET_LUT:
+        LUT_ResetDefaults();
+        break;
+
+    /* --- LUT ---------------------------------------------------------------- */
+    case COM_CTRL_OP_SETLUTGAIN:
+        status = set_lut_gain(args);
+        break;
+    case COM_CTRL_OP_SETLUTVALID:
+        status = set_lut_valid(args);
+        break;
+    case COM_CTRL_OP_SETLUTPOWER:
+        status = set_lut_power(args);
+        break;
+    case COM_CTRL_OP_SETLUTSETPOINT:
+        status = set_lut_setpoint(args);
+        break;
+
+    /* --- Maschere ----------------------------------------------------------- */
+    case COM_CTRL_OP_SETERRMASK:
+    case COM_CTRL_OP_SETWARNMASK:
+    case COM_CTRL_OP_SETFAULTMASK:
+    case COM_CTRL_OP_SETFAULTLATCH:
+    case COM_CTRL_OP_SET_TEMP_MASK:
+    case COM_CTRL_OP_SET_FLOW_MASK:
+    case COM_CTRL_OP_SET_PSU_MASK:
+    case COM_CTRL_OP_SET_CONTACTOR_MASK:
+    case COM_CTRL_OP_SET_EFUSE_MASK:
+    case COM_CTRL_OP_SET_PD_MASK:
+        status = set_mask(opcode, args);
+        break;
+
+    /* --- Ritardi e mappa NTC ------------------------------------------------ */
+    case COM_CTRL_OP_SET_DELAY:
+        status = set_delay(args);
+        break;
+    case COM_CTRL_OP_SET_NTC_MAP:
+        status = set_ntc_map(args);
         break;
 
     /* --- Soglie (argomenti da COM_CTRL_PAYLOAD_ARGS) ------------------------ */
@@ -669,29 +898,12 @@ void COM_App_HandleControl(const uint8_t *req_payload, uint8_t *resp_payload)
         break;
 
     /*
-     * TODO: comandi ad argomenti (indice/valore LUT, mask a 32 bit, mappa NTC,
-     * password, timestamp, RS485 baud/term...) non ancora implementati lato
-     * MMC — il payload li veicola gia' da COM_CTRL_PAYLOAD_ARGS (vedi
-     * COM_interface_protocol.h): rifiutati esplicitamente.
+     * TODO: comandi ad argomenti (tensione/corrente PSU, timestamp, RS485
+     * term...) non ancora implementati lato MMC — il payload li veicola gia'
+     * da COM_CTRL_PAYLOAD_ARGS (vedi COM_interface_protocol.h): rifiutati
+     * esplicitamente.
      */
-    case COM_CTRL_OP_SETLUTGAIN:
-    case COM_CTRL_OP_SETLUTVALID:
-    case COM_CTRL_OP_SETLUTPOWER:
-    case COM_CTRL_OP_SETLUTSETPOINT:
-    case COM_CTRL_OP_SETERRMASK:
-    case COM_CTRL_OP_SETWARNMASK:
-    case COM_CTRL_OP_SETFAULTMASK:
-    case COM_CTRL_OP_SETFAULTLATCH:
-    case COM_CTRL_OP_SET_TEMP_MASK:
-    case COM_CTRL_OP_SET_FLOW_MASK:
-    case COM_CTRL_OP_SET_PSU_MASK:
-    case COM_CTRL_OP_SET_CONTACTOR_MASK:
-    case COM_CTRL_OP_SET_EFUSE_MASK:
-    case COM_CTRL_OP_SET_PD_MASK:
-    case COM_CTRL_OP_SET_DELAY:
     case COM_CTRL_OP_SET_PSU_V:
-    case COM_CTRL_OP_SET_NTC_MAP:
-    case COM_CTRL_OP_SET_PASS:
     case COM_CTRL_OP_SETTIME:
     case COM_CTRL_OP_SETDATE:
     case COM_CTRL_OP_SETTERM:

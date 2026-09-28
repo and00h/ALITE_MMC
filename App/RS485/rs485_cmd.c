@@ -956,11 +956,46 @@ static void cmd_frst(void)
 /* GESTORI COMANDI — AUTENTICAZIONE                                           */
 /* ========================================================================== */
 
+/* Copia di pw in maiuscolo (le password sono case-insensitive: la riga RS485
+ * arriva gia' in maiuscolo, quella dalla COM interface no). false se pw non
+ * sta in s_password. */
+static bool pw_upper_copy(const char *pw, char dst[sizeof(s_password)])
+{
+    size_t n = 0U;
+    while (n < sizeof(s_password) && pw[n] != '\0') { n++; }
+    if (n >= sizeof(s_password)) { return false; }
+    memcpy(dst, pw, n + 1U);
+    str_upper(dst);
+    return true;
+}
+
+bool Rs485Cmd_CheckPassword(const char *pw)
+{
+    char up[sizeof(s_password)];
+    return (pw != NULL) && pw_upper_copy(pw, up) && (strcmp(up, s_password) == 0);
+}
+
+Rs485PwStatus_t Rs485Cmd_ChangePassword(const char *old_pw, const char *new_pw)
+{
+    if (!Rs485Cmd_CheckPassword(old_pw)) { return RS485_PW_WRONG_OLD; }
+
+    char up[sizeof(s_password)];
+    if (new_pw == NULL || !pw_upper_copy(new_pw, up) || strlen(up) < 4U) { return RS485_PW_INVALID_NEW; }
+    memcpy(s_password, up, sizeof(s_password));
+    return RS485_PW_OK;
+}
+
+uint8_t Rs485Cmd_NtcSerigrafiaToCh(uint8_t serigrafia)
+{
+    if (serigrafia < 1U || serigrafia > 16U) { return 0xFFU; }
+    return s_ntc_serigrafia_to_ch[serigrafia - 1U];
+}
+
 static void cmd_login(char **tok, int n)
 {
     if (n < 2) { err("USAGE: LOGIN <password>"); return; }
     if (s_authenticated) { ok("already authenticated"); return; }
-    if (strcmp(tok[1], s_password) != 0) { err("wrong password"); return; }
+    if (!Rs485Cmd_CheckPassword(tok[1])) { err("wrong password"); return; }
     s_authenticated  = true;
     s_auth_last_tick = osKernelGetTickCount();
     ok("authenticated - session timeout 5min");
@@ -1920,10 +1955,9 @@ static void cmd_set(char **tok, int n)
     } else if (strcmp(tok[1], "PASSWORD") == 0) {
         REQUIRE_AUTH();
         if (n < 4) { err("USAGE: SET PASSWORD <old> <new>"); return; }
-        if (strcmp(tok[2], s_password) != 0) { err("wrong old password"); return; }
-        size_t nl = strlen(tok[3]);
-        if (nl < 4U || nl > 15U) { err("new password: 4-15 chars"); return; }
-        memcpy(s_password, tok[3], nl + 1U);
+        Rs485PwStatus_t pw_st = Rs485Cmd_ChangePassword(tok[2], tok[3]);
+        if (pw_st == RS485_PW_WRONG_OLD)   { err("wrong old password"); return; }
+        if (pw_st == RS485_PW_INVALID_NEW) { err("new password: 4-15 chars"); return; }
         ok("password changed");
 
     /* ------------------------------------------------------------------
